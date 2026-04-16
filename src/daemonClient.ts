@@ -58,7 +58,7 @@ export class DaemonWebSocketClient {
   private ws: WebSocket | null = null;
   private nextId = 1;
   private pending = new Map<
-    number,
+    string,
     { resolve: (v: unknown) => void; reject: (e: Error) => void }
   >();
   private readonly opts: Required<DaemonWebSocketClientOptions>;
@@ -117,9 +117,10 @@ export class DaemonWebSocketClient {
 
   private onMessage(raw: string): void {
     let msg: {
-      id?: number | string;
+      requestId?: string;
       type?: string;
       error?: { message?: string } | string;
+      success?: boolean;
       [k: string]: unknown;
     };
     try {
@@ -129,23 +130,24 @@ export class DaemonWebSocketClient {
     }
     // Drop the daemon's pong heartbeat.
     if (msg.type === 'pong') return;
-    const idValue = msg.id;
-    const numericId =
-      typeof idValue === 'number'
-        ? idValue
-        : typeof idValue === 'string'
-          ? Number.parseInt(idValue, 10)
-          : NaN;
-    if (Number.isNaN(numericId)) return;
-    const waiter = this.pending.get(numericId);
+    const requestId = msg.requestId;
+    if (typeof requestId !== 'string') return;
+    const waiter = this.pending.get(requestId);
     if (!waiter) return;
-    this.pending.delete(numericId);
+    this.pending.delete(requestId);
+    // The daemon signals errors either via an `error` field or via
+    // `success: false` with the failure details inline on the envelope.
     if (msg.error) {
       const errMsg =
         typeof msg.error === 'string'
           ? msg.error
           : (msg.error.message ?? JSON.stringify(msg.error));
       waiter.reject(new Error(`Daemon RPC error: ${errMsg}`));
+      return;
+    }
+    if (msg.success === false) {
+      const m = (msg.message as string | undefined) ?? JSON.stringify(msg);
+      waiter.reject(new Error(`Daemon RPC failed: ${m}`));
       return;
     }
     waiter.resolve(msg);
@@ -156,35 +158,35 @@ export class DaemonWebSocketClient {
    * argument is camelCase (e.g. `listCapabilities`) and is translated to
    * snake_case (`list_capabilities`) to match the daemon's protocol. The
    * params object is flattened onto the envelope. Returns the full response
-   * object (minus `id` and `type`) so callers can pick off `capabilities`,
-   * `capability`, `profile`, `result`, etc. as needed.
+   * object so callers can pick off `capabilities`, `capability`, `profile`,
+   * etc. as needed.
    */
   async call<T = unknown>(method: string, params: object = {}): Promise<T> {
     await this.connect();
     if (!this.ws) throw new Error('DaemonWebSocketClient not connected');
-    const id = this.nextId++;
+    const requestId = `rpc-${this.nextId++}`;
     const type = camelToSnake(method);
     const envelope: Record<string, unknown> = {
-      id,
+      requestId,
       type,
       origin: this.opts.origin,
       ...params,
     };
     const payload = JSON.stringify(envelope);
     return new Promise<T>((resolve, reject) => {
-      this.pending.set(id, {
+      this.pending.set(requestId, {
         resolve: (v) => resolve(v as T),
         reject,
       });
       this.ws!.send(payload, (err) => {
         if (err) {
-          this.pending.delete(id);
+          this.pending.delete(requestId);
           reject(err);
         }
       });
       setTimeout(() => {
-        if (this.pending.has(id)) {
-          this.pending.delete(id);
+        if (this.pending.has(requestId)) {
+          this.pending.delete(requestId);
           reject(
             new Error(
               `Daemon RPC '${method}' (type=${type}) timed out after ${this.opts.rpcTimeoutMs}ms. ` +
