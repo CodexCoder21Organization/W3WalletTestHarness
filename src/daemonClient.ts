@@ -1,15 +1,18 @@
 /**
  * Direct WebSocket RPC client for the W3WalletDaemon.
  *
- * Consolidates two prior implementations:
- *   - W3WalletJavascriptCoinCollectorDemo (used `type`-tagged envelopes)
- *   - W3WalletJvmServerSideCoinCollectorDemo (used JSON-RPC `method`/`params`
- *     envelopes)
- *
- * The daemon supports both envelope styles. This client defaults to the
- * JSON-RPC style ({id, method, params, origin}) which is more recent, but
- * exposes a low-level {@link sendRaw} hook for tests that want to assert on
- * legacy `type`-tagged messages.
+ * The daemon's WalletWebSocketHandler only accepts messages with a `type`
+ * field containing a snake_case operation name (e.g. `list_capabilities`)
+ * along with operation-specific params flattened onto the envelope — not
+ * JSON-RPC style. This client translates camelCase method calls into that
+ * envelope:
+ *   call("listCapabilities", { domain })  →  {"type":"list_capabilities",
+ *                                              "domain":"…","id":N,
+ *                                              "origin":"…"}
+ * Responses come back shaped as
+ *   {"id":N, "type":"list_capabilities_response", "capabilities":[…]}
+ * so `call` extracts the non-metadata fields ({capabilities, capability,
+ * profile, profiles, result, …}) and returns them sensibly.
  *
  * No mocks: tests that use this class must point it at a running daemon
  * started by {@link DaemonManager}.
@@ -115,7 +118,7 @@ export class DaemonWebSocketClient {
   private onMessage(raw: string): void {
     let msg: {
       id?: number | string;
-      result?: unknown;
+      type?: string;
       error?: { message?: string } | string;
       [k: string]: unknown;
     };
@@ -124,6 +127,8 @@ export class DaemonWebSocketClient {
     } catch {
       return; // non-JSON heartbeat — ignore
     }
+    // Drop the daemon's pong heartbeat.
+    if (msg.type === 'pong') return;
     const idValue = msg.id;
     const numericId =
       typeof idValue === 'number'
@@ -143,24 +148,29 @@ export class DaemonWebSocketClient {
       waiter.reject(new Error(`Daemon RPC error: ${errMsg}`));
       return;
     }
-    waiter.resolve(msg.result !== undefined ? msg.result : msg);
+    waiter.resolve(msg);
   }
 
   /**
-   * Invoke an RPC method via JSON-RPC envelope. Returns the `result` field
-   * of the response. For older daemon protocols that respond without a
-   * `result` field, the entire response object is returned.
+   * Invoke a daemon operation using its `type`-tagged envelope. The method
+   * argument is camelCase (e.g. `listCapabilities`) and is translated to
+   * snake_case (`list_capabilities`) to match the daemon's protocol. The
+   * params object is flattened onto the envelope. Returns the full response
+   * object (minus `id` and `type`) so callers can pick off `capabilities`,
+   * `capability`, `profile`, `result`, etc. as needed.
    */
-  async call<T = unknown>(method: string, params: unknown = {}): Promise<T> {
+  async call<T = unknown>(method: string, params: object = {}): Promise<T> {
     await this.connect();
     if (!this.ws) throw new Error('DaemonWebSocketClient not connected');
     const id = this.nextId++;
-    const payload = JSON.stringify({
+    const type = camelToSnake(method);
+    const envelope: Record<string, unknown> = {
       id,
-      method,
-      params,
+      type,
       origin: this.opts.origin,
-    });
+      ...params,
+    };
+    const payload = JSON.stringify(envelope);
     return new Promise<T>((resolve, reject) => {
       this.pending.set(id, {
         resolve: (v) => resolve(v as T),
@@ -177,8 +187,8 @@ export class DaemonWebSocketClient {
           this.pending.delete(id);
           reject(
             new Error(
-              `Daemon RPC '${method}' timed out after ${this.opts.rpcTimeoutMs}ms. ` +
-                `Params: ${JSON.stringify(params)}`,
+              `Daemon RPC '${method}' (type=${type}) timed out after ${this.opts.rpcTimeoutMs}ms. ` +
+                `Envelope: ${payload}`,
             ),
           );
         }
@@ -222,9 +232,14 @@ export class DaemonWebSocketClient {
 
   // ---- High-level convenience methods --------------------------------------
 
-  async listCapabilities(): Promise<DaemonCapability[]> {
-    const result = await this.call<unknown>('listCapabilities', {});
-    return normalizeCapabilities(result);
+  async listCapabilities(
+    params: Record<string, unknown> = {},
+  ): Promise<DaemonCapability[]> {
+    const result = await this.call<{ capabilities?: unknown }>(
+      'listCapabilities',
+      params,
+    );
+    return normalizeCapabilities(result.capabilities);
   }
 
   async createCapability(
@@ -234,9 +249,7 @@ export class DaemonWebSocketClient {
       'createCapability',
       params,
     );
-    if (result && typeof result === 'object' && 'capability' in result) {
-      return result.capability as DaemonCapability;
-    }
+    if (result.capability) return result.capability;
     return result as unknown as DaemonCapability;
   }
 
@@ -244,10 +257,12 @@ export class DaemonWebSocketClient {
     capabilityId: string,
     updates: Record<string, unknown>,
   ): Promise<DaemonCapability> {
-    return this.call<DaemonCapability>('updateCapability', {
-      capabilityId,
-      ...updates,
-    });
+    const result = await this.call<{ capability?: DaemonCapability }>(
+      'updateCapability',
+      { capabilityId, ...updates },
+    );
+    if (result.capability) return result.capability;
+    return result as unknown as DaemonCapability;
   }
 
   async deleteCapability(capabilityId: string): Promise<void> {
@@ -261,19 +276,18 @@ export class DaemonWebSocketClient {
       'createProfile',
       params,
     );
-    if (result && typeof result === 'object' && 'profile' in result) {
-      return result.profile as DaemonProfile;
-    }
+    if (result.profile) return result.profile;
     return result as unknown as DaemonProfile;
   }
 }
 
+/** camelCase → snake_case for daemon message `type` names. */
+function camelToSnake(name: string): string {
+  return name.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`).replace(/^_/, '');
+}
+
 function normalizeCapabilities(raw: unknown): DaemonCapability[] {
   if (Array.isArray(raw)) return raw as DaemonCapability[];
-  if (raw && typeof raw === 'object' && 'capabilities' in raw) {
-    const list = (raw as { capabilities?: unknown }).capabilities;
-    if (Array.isArray(list)) return list as DaemonCapability[];
-  }
   return [];
 }
 
