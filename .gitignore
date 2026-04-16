@@ -1,0 +1,14 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+.vscode/
+.idea/
+
+# Test artifacts
+/tests/.tmp/
+/tests/.deps/
+/tests/certs/
+/tests/daemon-data/
+/coverage/
+*.tsbuildinfo
