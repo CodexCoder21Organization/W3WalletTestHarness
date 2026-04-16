@@ -101,10 +101,25 @@ export async function startJvmDemo(
   const jar = options.jarPath ?? buildJvmDemoIfNeeded();
   const backendPort = options.port;
 
-  const args = ['-jar', jar, '--port', String(backendPort)];
+  // kompile's buildFatJar rule produces an executable shell launcher (with
+  // a #!/bin/bash shebang) rather than a conventional fat JAR. Detect that
+  // format and invoke it directly; otherwise use java -jar.
+  const jarHeader = fs.readFileSync(jar).subarray(0, 9).toString('utf8');
+  const isShellLauncher = jarHeader.startsWith('#!/bin/');
+
+  let command: string;
+  let args: string[];
+  if (isShellLauncher) {
+    fs.chmodSync(jar, 0o755);
+    command = jar;
+    args = ['--port', String(backendPort)];
+  } else {
+    command = 'java';
+    args = ['-jar', jar, '--port', String(backendPort)];
+  }
   if (options.daemonUrl) args.push('--daemon-url', options.daemonUrl);
 
-  const managed = spawnProcess('java', args, {
+  const managed = spawnProcess(command, args, {
     inheritOutput: options.inheritOutput ?? false,
     logPrefix: '[jvm-demo] ',
     env: { ...process.env, ...(options.env ?? {}) },
