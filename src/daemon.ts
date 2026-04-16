@@ -163,13 +163,13 @@ export async function startDaemon(
     String(port),
     '--db',
     dbPath,
-    '--peers-directory',
+    '--peers-dir',
     peersDir,
   ];
-  if (options.enableUrlProtocol) args.push('--enable-url-protocol');
-  if (options.bootstrapPeer) {
-    args.push('--bootstrap-peer', options.bootstrapPeer);
-  }
+  // Note: the W3WalletDaemon's Main.kt accepts only --db and --peers-dir in
+  // addition to --port / --help. url:// protocol is registered automatically
+  // on startup. enableUrlProtocol / bootstrapPeer are no-ops today and kept
+  // for forward-compat in case future daemon versions add them.
 
   const managed = spawnProcess('java', args, {
     env: { ...process.env, ...(options.env ?? {}) },
