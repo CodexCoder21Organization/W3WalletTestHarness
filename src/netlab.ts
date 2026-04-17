@@ -10,8 +10,9 @@
  *   NETLAB_CLI_JAR       Absolute path to the NetLabCLI fatJar
  *                        (default: /srv/w3wallet-netlab-test/jars/netlab-cli-all.jar).
  *   NETLAB_SERVICE_URL   NetLab service URL (default: url://netlab/).
- *   NETLAB_JAR_DIR       Where W3Wallet JARs are staged on the NetLab server
- *                        (default: /srv/w3wallet-netlab-test/jars).
+ *   NETLAB_JAR_DIR       Unused since artifact staging moved into the
+ *                        NetLab worker (uploadFileToTopology + implicit
+ *                        /jars mount). Kept as an export for back-compat.
  *   NETLAB_WORK_DIR      Per-host work-dir root on the NetLab server
  *                        (default: /srv/w3wallet-netlab-test/work).
  *   NETLAB_SKIP          If "true", consumers should call {@link skipReason}
@@ -192,6 +193,54 @@ export async function fetchLogs(
   return obj.logs;
 }
 
+/**
+ * Upload a local file into the topology's staging area on the NetLab
+ * worker host. The CLI streams the file across the wire in 1 MiB chunks so
+ * large JARs do not buffer in memory.
+ *
+ * After this call returns, the uploaded file is accessible inside every
+ * container of the topology at `/jars/<destinationPath>` — the worker
+ * implicitly bind-mounts the per-topology staging area at /jars:ro in
+ * every host at apply() time. No explicit volume declaration needed.
+ *
+ * ```ts
+ * await uploadFileToTopology(name, '/path/to/daemon-all.jar',
+ *     'daemon-all.jar');
+ * // Inside any host of `name`:  /jars/daemon-all.jar
+ * ```
+ */
+export async function uploadFileToTopology(
+  topologyName: string,
+  localPath: string,
+  destinationPath: string,
+): Promise<void> {
+  if (!fs.existsSync(localPath)) {
+    throw new Error(
+      `uploadFileToTopology: source file does not exist: ${localPath} ` +
+        `(resolved to ${path.resolve(localPath)})`,
+    );
+  }
+  const stat = fs.statSync(localPath);
+  if (!stat.isFile()) {
+    throw new Error(
+      `uploadFileToTopology: source must be a regular file, not a directory/symlink: ${localPath}`,
+    );
+  }
+  // The CLI itself streams chunks — a wall-clock budget of 10 min per upload
+  // is plenty for a ~100 MB JAR on a public-cloud link.
+  const result = await runNetlabCli(
+    ['upload-file', topologyName, localPath, destinationPath],
+    { timeoutMs: 600_000 },
+  );
+  if (result.exitCode !== 0) {
+    throw new Error(
+      `netlab-cli upload-file ${topologyName} ${localPath} ${destinationPath} ` +
+        `failed (exit=${result.exitCode}). stdout=${result.stdout.trim()} ` +
+        `stderr=${result.stderr.trim()}`,
+    );
+  }
+}
+
 /** Execute a command inside a host container and return the result. */
 export async function execInHost(
   topologyName: string,
@@ -307,7 +356,15 @@ export function uniqueTopologyName(scenario: string): string {
 }
 
 export interface TopologyOverrides {
-  /** Make the relay-host exit immediately (test_nat_relay_unavailable). */
+  /**
+   * No-op; preserved for API compatibility. Previously made the topology's
+   * in-cluster relay host exit immediately. The topology no longer includes
+   * a dedicated relay host (every UrlResolver is a relay), so tests that
+   * wanted "no relay available" should instead use iptables / firewall
+   * rules on the daemon host to block access to the public relay mesh.
+   *
+   * @deprecated will be removed in a future minor version
+   */
   disableRelay?: boolean;
   /** Make the daemon-host exit immediately after a scripted message. */
   daemonExitAfterStart?: boolean;
@@ -315,26 +372,31 @@ export interface TopologyOverrides {
 
 /**
  * Render the canonical W3Wallet NAT-traversal topology. Built
- * programmatically so tests can apply per-scenario variations (disabling
- * the relay, scripting an early daemon exit, …).
+ * programmatically so tests can apply per-scenario variations (scripting
+ * an early daemon exit, …).
+ *
+ * The topology has no dedicated relay host: every UrlResolver instance
+ * (including W3WalletDaemon) participates as a libp2p relay by default
+ * and bootstraps from the public ambient relay network baked into
+ * UrlProtocol2's defaults. `daemon-host` and `public-host` therefore
+ * discover each other via the public relay — the NAT between them is
+ * what the test is actually exercising.
+ *
+ * Artifact JARs referenced by the host commands (W3WalletDaemon,
+ * W3JvmServerSideWalletDemo) must be uploaded into the topology via
+ * {@link uploadFileToTopology} *before* {@link applyTopology} is called.
+ * They become available at `/jars/<destPath>` inside each host via the
+ * worker's implicit staging bind-mount.
+ *
+ * Legacy `NETLAB_WORK_DIR` is still used for the mutable per-role
+ * /work directory (it doesn't contain artifacts, just runtime files
+ * like the daemon's wallet.db).
  */
 export function buildTopology(
   name: string,
   overrides: TopologyOverrides = {},
 ): object {
-  const jarDir = NETLAB_JAR_DIR;
   const workDir = NETLAB_WORK_DIR;
-
-  const relayCommand = overrides.disableRelay
-    ? ['sh', '-c', 'echo "relay disabled for test"; sleep 600']
-    : [
-        'sh',
-        '-c',
-        'set -e; cd /work && exec java -jar /jars/UrlRelayServer-all.jar ' +
-          '--listen-port 4002 ' +
-          '--peer-id-file /work/relay-peer-id.txt ' +
-          '--multiaddress-file /work/relay-multiaddr.txt',
-      ];
 
   const daemonCommand = overrides.daemonExitAfterStart
     ? [
@@ -349,12 +411,8 @@ export function buildTopology(
         '-c',
         'set -e; ip route del default 2>/dev/null || true; ' +
           'ip route add default via 192.168.1.254; ' +
-          'for i in $(seq 1 60); do ' +
-          '[ -s /work/../relay/relay-multiaddr.txt ] && break; sleep 1; done; ' +
-          'RELAY=$(cat /work/../relay/relay-multiaddr.txt); ' +
-          'echo "Daemon using relay $RELAY"; ' +
           'exec java -jar /jars/W3WalletDaemon-1.0.0-SNAPSHOT-all.jar ' +
-          '--port 7380 --db /work/wallet.db --bootstrap-peer "$RELAY"',
+          '--port 7380 --db /work/wallet.db',
       ];
 
   return {
@@ -381,46 +439,31 @@ export function buildTopology(
         external_ip: '10.0.0.254',
       },
     },
+    // Intentionally no dedicated relay host. Every UrlResolver instance
+    // (both daemon-host and public-host below) participates as a relay by
+    // default and bootstraps from UrlProtocol2's public-relay list, so the
+    // NAT path exercised by this test uses the real production relay mesh.
     hosts: {
-      'relay-host': {
-        image: 'eclipse-temurin:17-jre-jammy',
-        networks: [{ network: 'public-switch', ip: '10.0.0.10' }],
-        volumes: [
-          `${jarDir}:/jars:ro`,
-          `${workDir}/relay:/work`,
-        ],
-        environment: { ROLE: 'url_relay' },
-        command: relayCommand,
-      },
       'public-host': {
         image: 'eclipse-temurin:17-jre-jammy',
         networks: [{ network: 'public-switch', ip: '10.0.0.20' }],
-        volumes: [
-          `${jarDir}:/jars:ro`,
-          `${workDir}/public:/work`,
-          `${workDir}/relay:/work-relay:ro`,
-        ],
+        // The netlab worker implicitly bind-mounts the per-env staging
+        // area at /jars:ro, so volumes here only need the mutable /work
+        // dir. Uploaded artifacts reached via `uploadFileToTopology` show
+        // up at /jars/<destPath>.
+        volumes: [`${workDir}/public:/work`],
         environment: { ROLE: 'demo_server' },
         command: [
           'sh',
           '-c',
-          'set -e; for i in $(seq 1 60); do ' +
-            '[ -s /work-relay/relay-multiaddr.txt ] && break; sleep 1; done; ' +
-            'RELAY=$(cat /work-relay/relay-multiaddr.txt); ' +
-            'echo "Demo server using relay $RELAY"; ' +
-            'exec java -jar /jars/W3JvmServerSideWalletDemo-all.jar ' +
-            '--port 8080 --bootstrap-peer "$RELAY"',
+          'exec java -jar /jars/W3JvmServerSideWalletDemo-all.jar --port 8080',
         ],
       },
       'daemon-host': {
         image: 'eclipse-temurin:17-jre-jammy',
         capabilities: ['NET_ADMIN'],
         networks: [{ network: 'home-switch', ip: '192.168.1.10' }],
-        volumes: [
-          `${jarDir}:/jars:ro`,
-          `${workDir}/daemon:/work`,
-          `${workDir}/relay:/work/../relay:ro`,
-        ],
+        volumes: [`${workDir}/daemon:/work`],
         environment: { ROLE: 'w3wallet_daemon' },
         command: daemonCommand,
       },
