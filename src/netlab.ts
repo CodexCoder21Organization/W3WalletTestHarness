@@ -390,7 +390,15 @@ export function uniqueTopologyName(scenario: string): string {
 }
 
 export interface TopologyOverrides {
-  /** Make the relay-host exit immediately (test_nat_relay_unavailable). */
+  /**
+   * No-op; preserved for API compatibility. Previously made the topology's
+   * in-cluster relay host exit immediately. The topology no longer includes
+   * a dedicated relay host (every UrlResolver is a relay), so tests that
+   * wanted "no relay available" should instead use iptables / firewall
+   * rules on the daemon host to block access to the public relay mesh.
+   *
+   * @deprecated will be removed in a future minor version
+   */
   disableRelay?: boolean;
   /** Make the daemon-host exit immediately after a scripted message. */
   daemonExitAfterStart?: boolean;
@@ -407,8 +415,15 @@ export interface TopologyOverrides {
 
 /**
  * Render the canonical W3Wallet NAT-traversal topology. Built
- * programmatically so tests can apply per-scenario variations (disabling
- * the relay, scripting an early daemon exit, …).
+ * programmatically so tests can apply per-scenario variations (scripting
+ * an early daemon exit, …).
+ *
+ * The topology has no dedicated relay host: every UrlResolver instance
+ * (including W3WalletDaemon) participates as a libp2p relay by default
+ * and bootstraps from the public ambient relay network baked into
+ * UrlProtocol2's defaults. `daemon-host` and `public-host` therefore
+ * discover each other via the public relay — the NAT between them is
+ * what the test is actually exercising.
  *
  * `overrides.stagingDir` should be the absolute worker-host path returned
  * by {@link topologyStagingDir} — the suite then uploads JARs into it via
@@ -426,17 +441,6 @@ export function buildTopology(
     ? `${overrides.stagingDir}/work`
     : NETLAB_WORK_DIR;
 
-  const relayCommand = overrides.disableRelay
-    ? ['sh', '-c', 'echo "relay disabled for test"; sleep 600']
-    : [
-        'sh',
-        '-c',
-        'set -e; cd /work && exec java -jar /jars/UrlRelayServer-all.jar ' +
-          '--listen-port 4002 ' +
-          '--peer-id-file /work/relay-peer-id.txt ' +
-          '--multiaddress-file /work/relay-multiaddr.txt',
-      ];
-
   const daemonCommand = overrides.daemonExitAfterStart
     ? [
         'sh',
@@ -450,12 +454,8 @@ export function buildTopology(
         '-c',
         'set -e; ip route del default 2>/dev/null || true; ' +
           'ip route add default via 192.168.1.254; ' +
-          'for i in $(seq 1 60); do ' +
-          '[ -s /work/../relay/relay-multiaddr.txt ] && break; sleep 1; done; ' +
-          'RELAY=$(cat /work/../relay/relay-multiaddr.txt); ' +
-          'echo "Daemon using relay $RELAY"; ' +
           'exec java -jar /jars/W3WalletDaemon-1.0.0-SNAPSHOT-all.jar ' +
-          '--port 7380 --db /work/wallet.db --bootstrap-peer "$RELAY"',
+          '--port 7380 --db /work/wallet.db',
       ];
 
   return {
@@ -482,35 +482,23 @@ export function buildTopology(
         external_ip: '10.0.0.254',
       },
     },
+    // Intentionally no dedicated relay host. Every UrlResolver instance
+    // (both daemon-host and public-host below) participates as a relay by
+    // default and bootstraps from UrlProtocol2's public-relay list, so the
+    // NAT path exercised by this test uses the real production relay mesh.
     hosts: {
-      'relay-host': {
-        image: 'eclipse-temurin:17-jre-jammy',
-        networks: [{ network: 'public-switch', ip: '10.0.0.10' }],
-        volumes: [
-          `${jarDir}:/jars:ro`,
-          `${workDir}/relay:/work`,
-        ],
-        environment: { ROLE: 'url_relay' },
-        command: relayCommand,
-      },
       'public-host': {
         image: 'eclipse-temurin:17-jre-jammy',
         networks: [{ network: 'public-switch', ip: '10.0.0.20' }],
         volumes: [
           `${jarDir}:/jars:ro`,
           `${workDir}/public:/work`,
-          `${workDir}/relay:/work-relay:ro`,
         ],
         environment: { ROLE: 'demo_server' },
         command: [
           'sh',
           '-c',
-          'set -e; for i in $(seq 1 60); do ' +
-            '[ -s /work-relay/relay-multiaddr.txt ] && break; sleep 1; done; ' +
-            'RELAY=$(cat /work-relay/relay-multiaddr.txt); ' +
-            'echo "Demo server using relay $RELAY"; ' +
-            'exec java -jar /jars/W3JvmServerSideWalletDemo-all.jar ' +
-            '--port 8080 --bootstrap-peer "$RELAY"',
+          'exec java -jar /jars/W3JvmServerSideWalletDemo-all.jar --port 8080',
         ],
       },
       'daemon-host': {
@@ -520,7 +508,6 @@ export function buildTopology(
         volumes: [
           `${jarDir}:/jars:ro`,
           `${workDir}/daemon:/work`,
-          `${workDir}/relay:/work/../relay:ro`,
         ],
         environment: { ROLE: 'w3wallet_daemon' },
         command: daemonCommand,
