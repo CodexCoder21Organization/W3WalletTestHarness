@@ -10,8 +10,9 @@
  *   NETLAB_CLI_JAR       Absolute path to the NetLabCLI fatJar
  *                        (default: /srv/w3wallet-netlab-test/jars/netlab-cli-all.jar).
  *   NETLAB_SERVICE_URL   NetLab service URL (default: url://netlab/).
- *   NETLAB_JAR_DIR       Where W3Wallet JARs are staged on the NetLab server
- *                        (default: /srv/w3wallet-netlab-test/jars).
+ *   NETLAB_JAR_DIR       Unused since artifact staging moved into the
+ *                        NetLab worker (uploadFileToTopology + implicit
+ *                        /jars mount). Kept as an export for back-compat.
  *   NETLAB_WORK_DIR      Per-host work-dir root on the NetLab server
  *                        (default: /srv/w3wallet-netlab-test/work).
  *   NETLAB_SKIP          If "true", consumers should call {@link skipReason}
@@ -193,54 +194,19 @@ export async function fetchLogs(
 }
 
 /**
- * Return the absolute per-topology staging directory on the NetLab worker
- * host. Use the returned path as the volume-mount source in
- * {@link buildTopology} options: `"${stagingDir}/jars:/jars:ro"`. See
- * netlab-api `TopologyService.stagingDir()` for the contract.
- *
- * Creates the directory on the worker if it didn't already exist — safe to
- * call before uploading any files.
- */
-export async function topologyStagingDir(topologyName: string): Promise<string> {
-  const result = await runNetlabCli(['staging-dir', topologyName], {
-    json: true,
-    timeoutMs: 60_000,
-  });
-  if (result.exitCode !== 0) {
-    throw new Error(
-      `netlab-cli staging-dir ${topologyName} failed (exit=${result.exitCode}). ` +
-        `stdout=${result.stdout.trim()} stderr=${result.stderr.trim()}`,
-    );
-  }
-  const trimmed = result.stdout.trim();
-  const start = trimmed.indexOf('{');
-  if (start < 0) {
-    throw new Error(
-      `netlab-cli staging-dir returned no JSON object. raw output:\n${trimmed}`,
-    );
-  }
-  const obj = JSON.parse(trimmed.substring(start));
-  if (typeof obj.stagingDir !== 'string') {
-    throw new Error(
-      `netlab-cli staging-dir JSON missing 'stagingDir' field. parsed=${JSON.stringify(obj)}`,
-    );
-  }
-  return obj.stagingDir;
-}
-
-/**
- * Upload a local file into the topology's staging directory on the NetLab
+ * Upload a local file into the topology's staging area on the NetLab
  * worker host. The CLI streams the file across the wire in 1 MiB chunks so
  * large JARs do not buffer in memory.
  *
- * After this call returns, the uploaded file is accessible inside containers
- * that mount the topology's staging dir as a volume:
+ * After this call returns, the uploaded file is accessible inside every
+ * container of the topology at `/jars/<destinationPath>` — the worker
+ * implicitly bind-mounts the per-topology staging area at /jars:ro in
+ * every host at apply() time. No explicit volume declaration needed.
  *
  * ```ts
- * const dir = await topologyStagingDir(name);
- * await uploadFileToTopology(name, '/path/to/daemon-all.jar', 'jars/daemon-all.jar');
- * // In HostConfig.volumes: `"${dir}/jars:/jars:ro"` makes /jars/daemon-all.jar
- * // visible to the container.
+ * await uploadFileToTopology(name, '/path/to/daemon-all.jar',
+ *     'daemon-all.jar');
+ * // Inside any host of `name`:  /jars/daemon-all.jar
  * ```
  */
 export async function uploadFileToTopology(
@@ -402,15 +368,6 @@ export interface TopologyOverrides {
   disableRelay?: boolean;
   /** Make the daemon-host exit immediately after a scripted message. */
   daemonExitAfterStart?: boolean;
-  /**
-   * Absolute path on the NetLab worker host where per-topology artifacts
-   * have been uploaded. Typically obtained via {@link topologyStagingDir}.
-   * When present, containers mount `${stagingDir}:/jars:ro` and
-   * `${stagingDir}/work/<role>:/work`. When absent, buildTopology falls
-   * back to `NETLAB_JAR_DIR` / `NETLAB_WORK_DIR` for back-compat with
-   * the legacy `url://netlab/` deployment that pre-stages JARs on disk.
-   */
-  stagingDir?: string;
 }
 
 /**
@@ -425,21 +382,21 @@ export interface TopologyOverrides {
  * discover each other via the public relay — the NAT between them is
  * what the test is actually exercising.
  *
- * `overrides.stagingDir` should be the absolute worker-host path returned
- * by {@link topologyStagingDir} — the suite then uploads JARs into it via
- * {@link uploadFileToTopology} and the containers mount `${stagingDir}`
- * as `/jars`. When omitted, falls back to the legacy `NETLAB_JAR_DIR` /
- * `NETLAB_WORK_DIR` host paths that presume a pre-staged jar location —
- * kept only for back-compat with the existing `url://netlab/` deployment.
+ * Artifact JARs referenced by the host commands (W3WalletDaemon,
+ * W3JvmServerSideWalletDemo) must be uploaded into the topology via
+ * {@link uploadFileToTopology} *before* {@link applyTopology} is called.
+ * They become available at `/jars/<destPath>` inside each host via the
+ * worker's implicit staging bind-mount.
+ *
+ * Legacy `NETLAB_WORK_DIR` is still used for the mutable per-role
+ * /work directory (it doesn't contain artifacts, just runtime files
+ * like the daemon's wallet.db).
  */
 export function buildTopology(
   name: string,
   overrides: TopologyOverrides = {},
 ): object {
-  const jarDir = overrides.stagingDir ?? NETLAB_JAR_DIR;
-  const workDir = overrides.stagingDir
-    ? `${overrides.stagingDir}/work`
-    : NETLAB_WORK_DIR;
+  const workDir = NETLAB_WORK_DIR;
 
   const daemonCommand = overrides.daemonExitAfterStart
     ? [
@@ -490,10 +447,11 @@ export function buildTopology(
       'public-host': {
         image: 'eclipse-temurin:17-jre-jammy',
         networks: [{ network: 'public-switch', ip: '10.0.0.20' }],
-        volumes: [
-          `${jarDir}:/jars:ro`,
-          `${workDir}/public:/work`,
-        ],
+        // The netlab worker implicitly bind-mounts the per-env staging
+        // area at /jars:ro, so volumes here only need the mutable /work
+        // dir. Uploaded artifacts reached via `uploadFileToTopology` show
+        // up at /jars/<destPath>.
+        volumes: [`${workDir}/public:/work`],
         environment: { ROLE: 'demo_server' },
         command: [
           'sh',
@@ -505,10 +463,7 @@ export function buildTopology(
         image: 'eclipse-temurin:17-jre-jammy',
         capabilities: ['NET_ADMIN'],
         networks: [{ network: 'home-switch', ip: '192.168.1.10' }],
-        volumes: [
-          `${jarDir}:/jars:ro`,
-          `${workDir}/daemon:/work`,
-        ],
+        volumes: [`${workDir}/daemon:/work`],
         environment: { ROLE: 'w3wallet_daemon' },
         command: daemonCommand,
       },
