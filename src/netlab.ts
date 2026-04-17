@@ -192,6 +192,89 @@ export async function fetchLogs(
   return obj.logs;
 }
 
+/**
+ * Return the absolute per-topology staging directory on the NetLab worker
+ * host. Use the returned path as the volume-mount source in
+ * {@link buildTopology} options: `"${stagingDir}/jars:/jars:ro"`. See
+ * netlab-api `TopologyService.stagingDir()` for the contract.
+ *
+ * Creates the directory on the worker if it didn't already exist — safe to
+ * call before uploading any files.
+ */
+export async function topologyStagingDir(topologyName: string): Promise<string> {
+  const result = await runNetlabCli(['staging-dir', topologyName], {
+    json: true,
+    timeoutMs: 60_000,
+  });
+  if (result.exitCode !== 0) {
+    throw new Error(
+      `netlab-cli staging-dir ${topologyName} failed (exit=${result.exitCode}). ` +
+        `stdout=${result.stdout.trim()} stderr=${result.stderr.trim()}`,
+    );
+  }
+  const trimmed = result.stdout.trim();
+  const start = trimmed.indexOf('{');
+  if (start < 0) {
+    throw new Error(
+      `netlab-cli staging-dir returned no JSON object. raw output:\n${trimmed}`,
+    );
+  }
+  const obj = JSON.parse(trimmed.substring(start));
+  if (typeof obj.stagingDir !== 'string') {
+    throw new Error(
+      `netlab-cli staging-dir JSON missing 'stagingDir' field. parsed=${JSON.stringify(obj)}`,
+    );
+  }
+  return obj.stagingDir;
+}
+
+/**
+ * Upload a local file into the topology's staging directory on the NetLab
+ * worker host. The CLI streams the file across the wire in 1 MiB chunks so
+ * large JARs do not buffer in memory.
+ *
+ * After this call returns, the uploaded file is accessible inside containers
+ * that mount the topology's staging dir as a volume:
+ *
+ * ```ts
+ * const dir = await topologyStagingDir(name);
+ * await uploadFileToTopology(name, '/path/to/daemon-all.jar', 'jars/daemon-all.jar');
+ * // In HostConfig.volumes: `"${dir}/jars:/jars:ro"` makes /jars/daemon-all.jar
+ * // visible to the container.
+ * ```
+ */
+export async function uploadFileToTopology(
+  topologyName: string,
+  localPath: string,
+  destinationPath: string,
+): Promise<void> {
+  if (!fs.existsSync(localPath)) {
+    throw new Error(
+      `uploadFileToTopology: source file does not exist: ${localPath} ` +
+        `(resolved to ${path.resolve(localPath)})`,
+    );
+  }
+  const stat = fs.statSync(localPath);
+  if (!stat.isFile()) {
+    throw new Error(
+      `uploadFileToTopology: source must be a regular file, not a directory/symlink: ${localPath}`,
+    );
+  }
+  // The CLI itself streams chunks — a wall-clock budget of 10 min per upload
+  // is plenty for a ~100 MB JAR on a public-cloud link.
+  const result = await runNetlabCli(
+    ['upload-file', topologyName, localPath, destinationPath],
+    { timeoutMs: 600_000 },
+  );
+  if (result.exitCode !== 0) {
+    throw new Error(
+      `netlab-cli upload-file ${topologyName} ${localPath} ${destinationPath} ` +
+        `failed (exit=${result.exitCode}). stdout=${result.stdout.trim()} ` +
+        `stderr=${result.stderr.trim()}`,
+    );
+  }
+}
+
 /** Execute a command inside a host container and return the result. */
 export async function execInHost(
   topologyName: string,
@@ -311,19 +394,37 @@ export interface TopologyOverrides {
   disableRelay?: boolean;
   /** Make the daemon-host exit immediately after a scripted message. */
   daemonExitAfterStart?: boolean;
+  /**
+   * Absolute path on the NetLab worker host where per-topology artifacts
+   * have been uploaded. Typically obtained via {@link topologyStagingDir}.
+   * When present, containers mount `${stagingDir}:/jars:ro` and
+   * `${stagingDir}/work/<role>:/work`. When absent, buildTopology falls
+   * back to `NETLAB_JAR_DIR` / `NETLAB_WORK_DIR` for back-compat with
+   * the legacy `url://netlab/` deployment that pre-stages JARs on disk.
+   */
+  stagingDir?: string;
 }
 
 /**
  * Render the canonical W3Wallet NAT-traversal topology. Built
  * programmatically so tests can apply per-scenario variations (disabling
  * the relay, scripting an early daemon exit, …).
+ *
+ * `overrides.stagingDir` should be the absolute worker-host path returned
+ * by {@link topologyStagingDir} — the suite then uploads JARs into it via
+ * {@link uploadFileToTopology} and the containers mount `${stagingDir}`
+ * as `/jars`. When omitted, falls back to the legacy `NETLAB_JAR_DIR` /
+ * `NETLAB_WORK_DIR` host paths that presume a pre-staged jar location —
+ * kept only for back-compat with the existing `url://netlab/` deployment.
  */
 export function buildTopology(
   name: string,
   overrides: TopologyOverrides = {},
 ): object {
-  const jarDir = NETLAB_JAR_DIR;
-  const workDir = NETLAB_WORK_DIR;
+  const jarDir = overrides.stagingDir ?? NETLAB_JAR_DIR;
+  const workDir = overrides.stagingDir
+    ? `${overrides.stagingDir}/work`
+    : NETLAB_WORK_DIR;
 
   const relayCommand = overrides.disableRelay
     ? ['sh', '-c', 'echo "relay disabled for test"; sleep 600']
